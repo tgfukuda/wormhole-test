@@ -145,7 +145,7 @@ class BridgeTransactor {
         };
     }
 
-    async createWrappedOnEthereumish({ vaaBytes }: GetSignedVAAResponse, ethereumish: Ethereumish): Promise<DestChainTxResult> {
+    async createWrappedOnEthereumish({ vaaBytes }: GetSignedVAAResponse, ethereumish: Ethereumish = 'ethereum'): Promise<DestChainTxResult> {
         const signer = this.ethSigner.connect(this.ethereumishRpcProviders[ethereumish]);
         const tx = await createWrappedOnEth(CONTRACTS.TESTNET[ethereumish].token_bridge, signer, vaaBytes);
 
@@ -193,7 +193,6 @@ class BridgeTransactor {
                 hash
             };
         } catch (e) {
-            console.error(e);
             throw new SolTxError((e as Error).message);
         }
     }
