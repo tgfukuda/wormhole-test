@@ -8,17 +8,27 @@ import { ASSOCIATED_TOKEN_PROGRAM_ID, Token, TOKEN_PROGRAM_ID } from '@solana/sp
 import { GetSignedVAAResponse } from '@certusone/wormhole-sdk-proto-web/lib/cjs/publicrpc/v1/publicrpc';
 import { base58_to_binary } from 'base58-js';
 
+/** need to use solana sdk lib on node runtime. */
 setDefaultWasm('node');
 
+/** public rpcs */
 const wormhorleRpcUrl = 'https://wormhole-v2-testnet-api.certus.one';
 const solanaRpcUrl = 'https://api.devnet.solana.com';
 const fujiCChainRpcUrl = 'https://api.avax-test.network/ext/bc/C/rpc';
 const mumbaiRocUrl = 'https://rpc-mumbai.matic.today';
 const bscRpcUrl = 'https://data-seed-prebsc-1-s1.binance.org:8545/';
 
+/**
+ * Beacon Upgraded event
+ * https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/proxy/ERC1967/ERC1967Upgrade.sol#L33
+ */
+const BeaconUpgradeHash = '0x1cf3b03a6cf19fa2baba4df148e9dcabedea7f8a5c07840e207e5c089be95d3e';
+
+/** node hates rpc, to avoid xhr implementation error. */
 const nodeTransport = {
     transport: NodeHttpTransport()
 };
+
 const defaultRetryTimeout = 1000;
 const defaultRetryLimit = 10;
 
@@ -66,19 +76,25 @@ type DestChainTxResult = {
     hash: string,
 };
 
+type NetworkType = 'MAINNET' | 'TESTNET';
+
 class BridgeTransactor {
     wormholeRpcUri: string;
+    /**
+     * base signer, keep in mind that it has no connection to rpc provider
+     * use `connectedEthSigner`
+     */
     ethSigner: ethers.Wallet;
-    solRpcProvider: Connection;
     solSigner: Keypair;
     ethereumishRpcProviders: Record<Exclude<Ethereumish, 'ethereum'>, ethers.providers.JsonRpcProvider> & {
         ethereum: ethers.providers.InfuraProvider,
     };
+    solRpcProvider: Connection;
+    network: NetworkType;
     
-
-    constructor(wormholeRpcUri: string, ethConf: EthereumConfig, solConf: SolanaConfig) {
+    constructor(wormholeRpcUri: string, ethConf: EthereumConfig, solConf: SolanaConfig, newtwork: NetworkType = 'TESTNET') {
         const keystoreJsonFile = fs.readdirSync(ethConf.keystorePath).pop();
-        this.wormholeRpcUri = wormholeRpcUri;
+        this.wormholeRpcUri = wormholeRpcUri || wormhorleRpcUrl;
         try {
             if (!keystoreJsonFile) {
                 throw new KeystoreNotFoundError("keystore may have no account.");
@@ -90,28 +106,48 @@ class BridgeTransactor {
                 polygon: new ethers.providers.JsonRpcProvider(ethConf.polygon || mumbaiRocUrl),
                 bsc: new ethers.providers.JsonRpcProvider(ethConf.bsc || bscRpcUrl),
             };
-
             this.ethSigner = ethers.Wallet.fromEncryptedJsonSync(
                 fs.readFileSync(path.join(ethConf.keystorePath, keystoreJsonFile)).toString(),
                 fs.readFileSync(ethConf.passwordPath)
             );
             this.solRpcProvider = new Connection(solConf.rpcUri || solanaRpcUrl, 'confirmed');
             this.solSigner = Keypair.fromSecretKey(base58_to_binary(fs.readFileSync(solConf.privKeyPath).toString()));
+            this.network = newtwork;
         } catch (e) {
             throw new InitWalletError((e as Error).message);
         }
     }
 
-    async getVAAFromEthereumishTxHash(hash: string, bridgeAddr: string, ethereumish: Ethereumish = 'ethereum') {
+    connectedEthSigner(ethereumish: Ethereumish): ethers.Signer {
+        return this.ethSigner.connect(this.ethereumishRpcProviders[ethereumish]);
+    }
+
+    async getTxEvents(hash: string, ethereumish: Ethereumish): Promise<ethers.providers.Log[]> {
+        const tx = await this.ethereumishRpcProviders[ethereumish].getTransactionReceipt(hash);
+
+        return tx.logs;
+    }
+
+    async getWrappedAddress(logs: ethers.providers.Log[]) {
+        for (const log of logs) {
+            if (log.topics[0] == BeaconUpgradeHash) {
+                return log.address;
+            }
+        }
+
+        return undefined;
+    }
+
+    async getVAAFromEthereumishTxHash(hash: string, vaaEmitterAddr: string, ethereumish: Ethereumish = 'ethereum'): Promise<GetSignedVAAResponse[]> {
         const receipt = await this.ethereumishRpcProviders[ethereumish].getTransactionReceipt(hash);
-        const sequence = parseSequencesFromLogEth(receipt, CONTRACTS.TESTNET[ethereumish].core);
+        const sequence = parseSequencesFromLogEth(receipt, CONTRACTS[this.network][ethereumish].core);
         const vaas = [];
 
         for (const log of sequence) {
             vaas.push(await getSignedVAAWithRetry(
                 [this.wormholeRpcUri],
                 CHAINS[ethereumish],
-                getEmitterAddressEth(bridgeAddr),
+                getEmitterAddressEth(vaaEmitterAddr),
                 log,
                 nodeTransport,
                 defaultRetryTimeout,
@@ -123,31 +159,39 @@ class BridgeTransactor {
     }
 
     async attestERC20FromEthereumish(tokenAddress: string, ethereumish: Ethereumish = 'ethereum'): Promise<SrcChainTxResult> {
-        const signer = this.ethSigner.connect(this.ethereumishRpcProviders[ethereumish]);
-        const receipt = await attestFromEth(CONTRACTS.TESTNET[ethereumish].token_bridge, signer, tokenAddress);
-        const sequence = parseSequencesFromLogEth(receipt, CONTRACTS.TESTNET[ethereumish].core);
+        const receipt = await attestFromEth(
+            CONTRACTS[this.network][ethereumish].token_bridge,
+            this.connectedEthSigner(ethereumish),
+            tokenAddress,
+        );
+        const sequence = parseSequencesFromLogEth(receipt, CONTRACTS[this.network][ethereumish].core);
         const vaas = [];
         for (const log of sequence) {
             vaas.push(await getSignedVAAWithRetry(
                 [this.wormholeRpcUri],
                 CHAINS[ethereumish],
-                getEmitterAddressEth(CONTRACTS.TESTNET[ethereumish].token_bridge),
+                getEmitterAddressEth(CONTRACTS[this.network][ethereumish].token_bridge),
                 log,
                 nodeTransport,
                 defaultRetryTimeout,
-                defaultRetryLimit
+                defaultRetryLimit,
             ));
         }
 
         return {
             hash: receipt.transactionHash,
-            vaas
+            vaas,
         };
     }
 
     async createWrappedOnEthereumish({ vaaBytes }: GetSignedVAAResponse, ethereumish: Ethereumish = 'ethereum'): Promise<DestChainTxResult> {
-        const signer = this.ethSigner.connect(this.ethereumishRpcProviders[ethereumish]);
-        const tx = await createWrappedOnEth(CONTRACTS.TESTNET[ethereumish].token_bridge, signer, vaaBytes);
+        const tx = await createWrappedOnEth(
+            CONTRACTS[this.network][ethereumish].token_bridge,
+            this.connectedEthSigner(ethereumish),
+            vaaBytes,
+        );
+
+        console.log("wrapped asset:", this.getWrappedAddress(tx.logs));
 
         return {
             hash: tx.transactionHash,
@@ -162,17 +206,17 @@ class BridgeTransactor {
                 transaction.partialSign(this.solSigner);
                 return transaction;
             },
-            CONTRACTS.TESTNET.solana.core,
+            CONTRACTS[this.network].solana.core,
             payerAddr,
-            Buffer.from(vaaBytes)
+            Buffer.from(vaaBytes),
         );
 
         const transaction = await createWrappedOnSolana(
             this.solRpcProvider,
-            CONTRACTS.TESTNET.solana.core,
-            CONTRACTS.TESTNET.solana.token_bridge,
+            CONTRACTS[this.network].solana.core,
+            CONTRACTS[this.network].solana.token_bridge,
             payerAddr,
-            vaaBytes
+            vaaBytes,
         );
         
         try {
@@ -190,7 +234,7 @@ class BridgeTransactor {
                 console.error(receipt.value.err);
             }
             return {
-                hash
+                hash,
             };
         } catch (e) {
             throw new SolTxError((e as Error).message);
@@ -200,19 +244,16 @@ class BridgeTransactor {
 
 const attestHash = '0x7fdcdd34ab07560a6b8d7423b598bc47a5ee80d78c270eaae957aa49f379d7d2';
 
-const transactor = new BridgeTransactor(wormhorleRpcUrl, {
+const ethDefaultConf = {
     keystorePath: process.env.KEYSTORE || "",
     passwordPath: process.env.PASSWORD || "",
     infuraApiKey: process.env.INFURA_API_KEY || "",
-}, {
+};
+const solDefaultConf = {
     privKeyPath: process.env.SOL_PRIV_KEY || "",
-});
+};
+const transactor = new BridgeTransactor(wormhorleRpcUrl, ethDefaultConf, solDefaultConf);
 
-const exaToken = "0x4319D92C172acaE5D37724C139f86179F37C29CC";
+const exaToken = "0x4319D92C172acaE5D37724C139f86179F37C29CC"; //ethereum
 
-(async () => {
-    const [vaa, ..._] = await transactor.getVAAFromEthereumishTxHash(attestHash, CONTRACTS.TESTNET.ethereum.token_bridge);
-    const createTx = await transactor.createWrappedOnEthereumish(vaa, 'avalanche');
-
-    console.log(createTx);
-})()
+transactor.getTxEvents('0x613d7da8ff04cc131594c9a1821c2190cd3ee67d94a7173d0bdf3175302ed424', 'avalanche').then((res) => transactor.getWrappedAddress(res)).then((res) => console.log(res));
