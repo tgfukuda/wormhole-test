@@ -30,7 +30,7 @@ import { Connection, Keypair, PublicKey, TokenAccountsFilter, Transaction } from
 import { ASSOCIATED_TOKEN_PROGRAM_ID, Token, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import { GetSignedVAAResponse } from '@certusone/wormhole-sdk-proto-web/lib/cjs/publicrpc/v1/publicrpc';
 import { base58_to_binary } from 'base58-js';
-import erc20 from './erc20.json';
+import erc20 from '../erc20.json';
 
 /** need to use solana sdk lib on node runtime. */
 setDefaultWasm('node');

@@ -1,8 +1,6 @@
 import { BridgeTransactor, Asset, printSolkeyFromBase58 } from './bridge';
-import ASSETS from './assets.testnet.json';
+import ASSETS from '../assets.testnet.json';
 import { ethers } from 'ethers';
-
-const assets = ASSETS as Asset;
 
 const attestHash = '0x7fdcdd34ab07560a6b8d7423b598bc47a5ee80d78c270eaae957aa49f379d7d2';
 const teleportHashSolana = '0xb612a6d7b654c45f0e9b9e77732de6641d594ec9e8d53e3e6a8c64262a2383eb';
@@ -21,4 +19,4 @@ const transactor = new BridgeTransactor(ethDefaultConf, solDefaultConf);
 
 const amount = ethers.BigNumber.from(ethers.utils.parseEther('1'));
 
-transactor.teleportERC20({ chain: 'ethereum', addr: ASSETS.ExampleToken.ethereum }, 'avalanche', 'ethereum', amount.div(2));
+transactor.listTokens({ chain: 'ethereum', addr: ASSETS.ExampleToken.ethereum }).then((res) => console.log(res))
