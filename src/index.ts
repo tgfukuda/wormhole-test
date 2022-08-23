@@ -1,4 +1,4 @@
-import { BridgeTransactor, Asset, printSolkeyFromBase58 } from './bridge';
+import { BridgeTransactor, Asset, printSolkeyFromBase58, GlobalAddr } from './bridge';
 import ASSETS from '../assets.testnet.json';
 import { ethers } from 'ethers';
 
@@ -18,5 +18,11 @@ const solDefaultConf = {
 const transactor = new BridgeTransactor(ethDefaultConf, solDefaultConf);
 
 const amount = ethers.BigNumber.from(ethers.utils.parseEther('1'));
+const origin: GlobalAddr = {
+    chain: 'ethereum',
+    addr: ASSETS.ExampleToken.ethereum,
+};
 
-transactor.listTokens({ chain: 'ethereum', addr: ASSETS.ExampleToken.ethereum }).then((res) => console.log(res))
+transactor.lockToken('ethereum', 'avalanche', ASSETS.ExampleToken.ethereum, amount)
+    .then(console.log)
+    
