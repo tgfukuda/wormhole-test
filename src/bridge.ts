@@ -109,6 +109,20 @@ export type NetworkType = 'MAINNET' | 'TESTNET';
 
 export type Asset = Record<string, Partial<Record<SupportedChain, string>>>;
 
+const retryInfinity: <T>(f: () => Promise<T>, pred?: (res: T) => boolean) => ReturnType<typeof f> =
+    async <T>(f: () => Promise<T>, pred?: (res: T) => boolean) => {
+        while (true) {
+            try {
+                const res = await f();
+                if (!(pred && pred(res))) {
+                    return res;
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        }
+};
+
 abstract class BaseTransactor {
     network: NetworkType;
 
@@ -533,6 +547,45 @@ export class BridgeTransactor {
         this.solTransactor = new SolanaTransactor(solConf, network);
     }
 
+    signerAddress(chain: SupportedChain) {
+        return (chain === 'solana') ? this.solTransactor.signer.publicKey.toBase58() : this.ethTransactors[chain].signer.address;
+    }
+
+    async getVAAWithSeq(sequence: string[], chain: SupportedChain, vaaEmitterAddr: string): Promise<GetSignedVAAResponse[]> {
+        return Promise.all(sequence.map(async (log) => getSignedVAAWithRetry(
+            [this.wormholeRpcUri],
+            CHAINS[chain],
+            (chain === 'solana') ? await getEmitterAddressSolana(vaaEmitterAddr) : getEmitterAddressEth(vaaEmitterAddr),
+            log,
+            nodeTransport,
+            DEFAULT_RETRY_TIMEOUT,
+            DEFAULT_RETRY_LIMIT
+        )));
+    }
+
+    async getVAAWithHash(hash: string, chain: SupportedChain, vaaEmiterAddr: string): Promise<GetSignedVAAResponse[]> {
+        const seq = (chain === 'solana') ? await this.solTransactor.getSeqFromTxHash(hash) : await this.ethTransactors[chain].getSeqFromTxHash(hash);
+        if (!seq || seq.length === 0) throw new Error("unknown error occurred");
+
+        return await this.getVAAWithSeq(seq, chain, vaaEmiterAddr);
+    }
+
+    async getTokenAddr(chain: SupportedChain, origin: GlobalAddr): Promise<GlobalAddr> {
+        if (chain === origin.chain) {
+            return origin;
+        }
+
+        const originTokenAddr = tryNativeToUint8Array(origin.addr || "", origin.chain);
+
+        return {
+            chain,
+            addr: (
+                (chain === 'solana') ? await this.solTransactor.getTokenAddr(origin.chain, originTokenAddr)
+                : await this.ethTransactors[chain].getTokenAddr(origin.chain, originTokenAddr)
+            ) || "",
+        };
+    }
+
     async listTokens(origin: GlobalAddr): Promise<Partial<Record<SupportedChain, string>>> {
         let result: Partial<Record<SupportedChain, string>> = {};
         await Promise.all(SUPPORTED_CHAINS.map(async (chain) => {
@@ -540,34 +593,6 @@ export class BridgeTransactor {
             result[chain] = addr || undefined;
         }));
         return result;
-    }
-
-    /** not atomic */
-    async teleportToken(origin: GlobalAddr, src: SupportedChain, dst: SupportedChain, amount: bigint): Promise<TeleportResult> {
-        if (src === dst) {
-            throw new Error("no need to bridge");
-        }
-
-        const srcRes = await this.lockToken(src, dst, origin, amount);
-        if (srcRes.vaas.length !== 1) console.log('expected vaa is one, but getting more or less');
-
-        const vaa = srcRes.vaas.pop();
-        if (!vaa) {
-            console.log(srcRes);
-            throw new Error("vaa is stil not signed by guardians. try again later.");
-        };
-
-        const destRes = await this.redeemToken(dst, vaa)
-            .catch((e) => {
-                console.log(srcRes);
-                return Promise.reject(e);
-            });
-
-        return { src: srcRes, dst: destRes };
-    }
-
-    signerAddress(chain: SupportedChain) {
-        return (chain === 'solana') ? this.solTransactor.signer.publicKey.toBase58() : this.ethTransactors[chain].signer.address;
     }
 
     async lockToken(src: SupportedChain, dst: SupportedChain, origin: GlobalAddr, amount: bigint): Promise<SrcChainTxResult> {
@@ -608,11 +633,9 @@ export class BridgeTransactor {
             return (dst === 'solana') ? this.solTransactor.redeemToken(vaa) : this.ethTransactors[dst].redeemToken(vaa);
         } else if (typeof info === 'string') {
             const txHash = info;
-            if (!src) throw new Error("source chain not provided");
-            const seq = (src === 'solana') ? await this.solTransactor.getSeqFromTxHash(txHash) : await this.ethTransactors[src].getSeqFromTxHash(txHash);
-            if (!seq || seq.length === 0) throw new Error("unknow error occurred");
+            if (!src) throw new Error("source chain not specified");
 
-            const vaas = await this.getVAAWithSeq(seq, src, CONTRACTS[this.network][src].token_bridge);
+            const vaas = await this.getVAAWithHash(txHash, src, CONTRACTS[this.network][src].token_bridge);
             const vaa = vaas.pop();
             if (!vaa) throw new Error("vaa is stil not signed by guardians");
             return (dst === 'solana') ? this.solTransactor.redeemToken(vaa) : this.ethTransactors[dst].redeemToken(vaa);
@@ -621,54 +644,19 @@ export class BridgeTransactor {
         }
     }
 
-    async getVAAWithSeq(sequence: string[], chain: SupportedChain, vaaEmitterAddr: string): Promise<GetSignedVAAResponse[]> {
-        return Promise.all(sequence.map(async (log) => getSignedVAAWithRetry(
-            [this.wormholeRpcUri],
-            CHAINS[chain],
-            (chain === 'solana') ? await getEmitterAddressSolana(vaaEmitterAddr) : getEmitterAddressEth(vaaEmitterAddr),
-            log,
-            nodeTransport,
-            DEFAULT_RETRY_TIMEOUT,
-            DEFAULT_RETRY_LIMIT
-        )));
-    }
-
-    async getTokenAddr(chain: SupportedChain, origin: GlobalAddr): Promise<GlobalAddr> {
-        if (chain === origin.chain) {
-            return origin;
+    /** not atomic */
+    async teleportToken(origin: GlobalAddr, src: SupportedChain, dst: SupportedChain, amount: bigint): Promise<TeleportResult> {
+        if (src === dst) {
+            throw new Error("no need to bridge");
         }
 
-        const originTokenAddr = tryNativeToUint8Array(origin.addr || "", origin.chain);
+        const srcRes = await this.lockToken(src, dst, origin, amount);
+        if (srcRes.vaas.length !== 1) console.log('expected vaa is one, but getting more or less');
+        console.log(srcRes);
 
-        return {
-            chain,
-            addr: (
-                (chain === 'solana') ? await this.solTransactor.getTokenAddr(origin.chain, originTokenAddr)
-                : await this.ethTransactors[chain].getTokenAddr(origin.chain, originTokenAddr)
-            ) || "",
-        };
-    }
+        const destRes = await retryInfinity(async () => await this.redeemToken(dst, srcRes.hash, src));
 
-    createWrapped(vaa: GetSignedVAAResponse, dst: SupportedChain): Promise<DestChainTxResult>;
-    createWrapped(txHash: string, dst: SupportedChain, src: SupportedChain): Promise<DestChainTxResult>;
-    async createWrapped(info: unknown, dst: SupportedChain, src?: SupportedChain): Promise<DestChainTxResult> {
-        if (typeof info === 'object') {
-            const vaa = info as GetSignedVAAResponse;
-            if (!vaa) throw new Error("unknow error occurred");
-            return (dst === 'solana') ? this.solTransactor.createWrapped(vaa) : this.ethTransactors[dst].createWrapped(vaa);
-        } else if (typeof info === 'string') {
-            const txHash = info;
-            if (!src) throw new Error("source chain not provided");
-            const seq = (src === 'solana') ? await this.solTransactor.getSeqFromTxHash(txHash) : await this.ethTransactors[src].getSeqFromTxHash(txHash);
-            if (!seq || seq.length === 0) throw new Error("unknow error occurred");
-
-            const vaas = await this.getVAAWithSeq(seq, src, CONTRACTS[this.network][src].token_bridge);
-            const vaa = vaas.pop();
-            if (!vaa) throw new Error("vaa is stil not signed by guardians");
-            return (dst === 'solana') ? this.solTransactor.createWrapped(vaa) : this.ethTransactors[dst].createWrapped(vaa);
-        } else {
-            throw new Error("unreachable");
-        }
+        return { src: srcRes, dst: destRes };
     }
 
     async attestToken(tokenAddr: string, from: SupportedChain): Promise<SrcChainTxResult> {
@@ -684,21 +672,46 @@ export class BridgeTransactor {
         return { hash, vaas };
     }
 
+    createWrapped(vaa: GetSignedVAAResponse, dst: SupportedChain): Promise<DestChainTxResult>;
+    createWrapped(txHash: string, dst: SupportedChain, src: SupportedChain): Promise<DestChainTxResult>;
+    async createWrapped(info: unknown, dst: SupportedChain, src?: SupportedChain): Promise<DestChainTxResult> {
+        if (typeof info === 'object') {
+            const vaa = info as GetSignedVAAResponse;
+            if (!vaa) throw new Error("unknow error occurred");
+            return (dst === 'solana') ? this.solTransactor.createWrapped(vaa) : this.ethTransactors[dst].createWrapped(vaa);
+        } else if (typeof info === 'string') {
+            const txHash = info;
+            if (!src) throw new Error("source chain not specified");
+
+            const vaas = await this.getVAAWithHash(txHash, src, CONTRACTS[this.network][src].token_bridge);
+            const vaa = vaas.pop();
+            if (!vaa) throw new Error("vaa is stil not signed by guardians");
+            return (dst === 'solana') ? this.solTransactor.createWrapped(vaa) : this.ethTransactors[dst].createWrapped(vaa);
+        } else {
+            throw new Error("unreachable");
+        }
+    }
+
     /** not atomic */
-    async attestAndWrap(token: string, src: Ethereumish, dsts: SupportedChain[]): Promise<BridgeInitResult> {
+    async attestAndWrap(token: string, src: SupportedChain, dsts: SupportedChain[]): Promise<BridgeInitResult> {
         /** attesting token and get Vaa */
         const target = [...new Set(dsts)].filter((dst) => dst !== src);
         if (target.length === 0) throw new Error("no valid destination");
 
         const { hash: srcHash, vaas } = await this.attestToken(token, src);
+        console.log(srcHash);
 
         if (vaas.length !== 1) console.log('expected vaa is one, but getting more or less');
 
-        const vaa = vaas.pop();
-        if (!vaa) {
-            console.log(srcHash);
-            throw new Error("vaa is stil not signed by guardians");
-        }
+        const vaa = vaas.length !== 0 ? vaas[0] : await retryInfinity(async () => {
+            const vaas = await this.getVAAWithHash(srcHash, src, CONTRACTS[this.network][src].token_bridge);
+            const vaa = vaas.pop();
+            if (vaa) {
+                return vaa;
+            } else {
+                throw "waiting for signed...";
+            }
+        });
 
         /** create wrapped token on each chain */
         const deployResult = await Promise.all(target.map(
