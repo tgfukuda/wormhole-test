@@ -20,13 +20,14 @@ import {
     transferFromSolana,
     redeemOnEth,
     tryUint8ArrayToNative,
-
+    getIsTransferCompletedSolana,
+    getIsTransferCompletedEth,
 } from '@certusone/wormhole-sdk';
 import { ethers } from 'ethers';
 import * as fs from 'fs';
 import * as path from 'path';
 import { NodeHttpTransport } from '@improbable-eng/grpc-web-node-http-transport';
-import { Connection, Keypair, PublicKey, TokenAccountsFilter, Transaction } from '@solana/web3.js';
+import { Connection, Keypair, PublicKey, TokenAccountsFilter, Transaction, clusterApiUrl } from '@solana/web3.js';
 import { ASSOCIATED_TOKEN_PROGRAM_ID, Token, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import { GetSignedVAAResponse } from '@certusone/wormhole-sdk-proto-web/lib/cjs/publicrpc/v1/publicrpc';
 import { base58_to_binary } from 'base58-js';
@@ -38,7 +39,7 @@ setDefaultWasm('node');
 /** public rpcs */
 const wormholeRpcUrl = 'https://wormhole-v2-testnet-api.certus.one';
 const defaultRpcs: Partial<Record<SupportedChain, string>> = {
-    'solana': 'https://api.devnet.solana.com',
+    'solana': clusterApiUrl('devnet'),
     'avalanche': 'https://api.avax-test.network/ext/bc/C/rpc',
     'polygon': 'https://rpc-mumbai.matic.today',
     'bsc': 'https://data-seed-prebsc-1-s1.binance.org:8545/',
@@ -119,6 +120,8 @@ abstract class BaseTransactor {
     abstract getTokenAddr(originChain: SupportedChain, originTokenAddr: Uint8Array): Promise<string | null>;
     abstract attestToken(tokenAddress: string): Promise<Attestation>;
     abstract createWrapped({ vaaBytes }: GetSignedVAAResponse): Promise<DestChainTxResult>;
+    abstract lockToken(dst: SupportedChain, to: Uint8Array, tokenAddr: string, amount: bigint): Promise<Attestation>;
+    abstract redeemToken({ vaaBytes }: GetSignedVAAResponse): Promise<DestChainTxResult>;
 }
 
 class EthereumishTransactor extends BaseTransactor {
@@ -189,28 +192,28 @@ class EthereumishTransactor extends BaseTransactor {
         return ethers.BigNumber.from(await token.allowance(this.signer.address, spender));
     }
 
-    async approveToken(tokenAddr: string, amount: ethers.BigNumber) {
+    async approveToken(tokenAddr: string, amount: ethers.BigNumber, spender: string = CONTRACTS[this.network][this.chain].token_bridge) {
         const token = new ethers.Contract(tokenAddr, erc20, this.connectedEthSigner());
-        return Boolean(await token.approve(CONTRACTS[this.network][this.chain].token_bridge, amount));
+        return Boolean(await token.approve(spender, amount));
     }
 
-    async lockToken(dst: SupportedChain, to: Uint8Array, tokenAddr: string, amount: ethers.BigNumber): Promise<Attestation> {
+    async lockToken(dst: SupportedChain, to: Uint8Array, tokenAddr: string, amount: bigint): Promise<Attestation> {
         const allowance = await this.getAllowance(
             tokenAddr,
             CONTRACTS[this.network][this.chain].token_bridge,
         );
 
-        const diff = amount.toBigInt() - allowance.toBigInt();
+        const diff = amount - allowance.toBigInt();
 
         if (0n < diff) {
-            await this.approveToken(CONTRACTS[this.network][this.chain].token_bridge, ethers.BigNumber.from(diff));
+            throw new Error(`insufficient allowance. approve at least ${diff}`);
         }
 
         const receipt = await transferFromEth(
             CONTRACTS[this.network][this.chain].token_bridge,
             this.connectedEthSigner(),
             tokenAddr,
-            amount,
+            ethers.BigNumber.from(amount),
             CHAINS[dst],
             to,
         );
@@ -223,6 +226,10 @@ class EthereumishTransactor extends BaseTransactor {
     }
 
     async redeemToken({ vaaBytes }: GetSignedVAAResponse): Promise<DestChainTxResult> {
+        if (await getIsTransferCompletedEth(CONTRACTS[this.network][this.chain].token_bridge, this.rpcProvider, vaaBytes)) {
+            throw new Error("transfer already completed");
+        }
+
         const receipt = await redeemOnEth(
             CONTRACTS[this.network][this.chain].token_bridge,
             this.connectedEthSigner(),
@@ -328,20 +335,20 @@ class SolanaTransactor extends BaseTransactor {
     /** create the associated account if it doesn't exist */
     async getAssociatedAccountInfo(tokenAddr: string) {
         const mintKey = new PublicKey(tokenAddr);
-        const receipient = await Token.getAssociatedTokenAddress(
+        const addr = await Token.getAssociatedTokenAddress(
             ASSOCIATED_TOKEN_PROGRAM_ID,
             TOKEN_PROGRAM_ID,
             mintKey,
             this.signer.publicKey
         );
-        const associatedInfo = await this.rpcProvider.getAccountInfo(receipient);
+        const associatedInfo = await this.rpcProvider.getAccountInfo(addr);
         if (!associatedInfo) {
             const transaction = new Transaction().add(
                 Token.createAssociatedTokenAccountInstruction(
                     ASSOCIATED_TOKEN_PROGRAM_ID,
                     TOKEN_PROGRAM_ID,
                     mintKey,
-                    receipient,
+                    addr,
                     this.signer.publicKey,
                     this.signer.publicKey
                 )
@@ -360,7 +367,7 @@ class SolanaTransactor extends BaseTransactor {
         }
 
         return {
-            receipient,
+            addr,
             associatedInfo,
         };
     }
@@ -377,31 +384,24 @@ class SolanaTransactor extends BaseTransactor {
             const tokenInfo = account.data.parsed.info;
             console.log(account.data.parsed);
             const address = tokenInfo.mint as string;
-            const amount = tokenInfo.tokenAmount.uiAmount as number;
+            const amount = tokenInfo.tokenAmount.uiAmount as bigint;
             if (address === tokenAddr) {
                 return amount;
             }
         }
 
-        return 0;
+        return 0n;
     }
 
     async lockToken(dst: SupportedChain, to: Uint8Array, tokenAddr: string, amount: BigInt): Promise<Attestation> {
-        const fromAddr = (
-            await Token.getAssociatedTokenAddress(
-                ASSOCIATED_TOKEN_PROGRAM_ID,
-                TOKEN_PROGRAM_ID,
-                new PublicKey(tokenAddr),
-                this.signer.publicKey,
-            )
-        ).toBase58();
+        const { addr: fromAddr } = await this.getAssociatedAccountInfo(tokenAddr);
         
         const transaction = await transferFromSolana(
             this.rpcProvider,
             CONTRACTS[this.network].solana.core,
             CONTRACTS[this.network].solana.token_bridge,
             this.signer.publicKey.toBase58(),
-            fromAddr,
+            fromAddr.toBase58(),
             tokenAddr,
             amount,
             to,
@@ -411,18 +411,32 @@ class SolanaTransactor extends BaseTransactor {
         
         const sequence = await this.getSeqFromTxHash(hash);
 
-        return {
-            hash,
-            sequence,
-        };
+        return { hash, sequence };
     }
 
     async redeemToken({ vaaBytes }: GetSignedVAAResponse): Promise<DestChainTxResult> {
+        const payerAddr = this.signer.publicKey.toBase58();
+
+        if (await getIsTransferCompletedSolana(CONTRACTS[this.network].solana.token_bridge, vaaBytes, this.rpcProvider)) {
+            throw new Error("transfer already completed");
+        }
+
+        await postVaaSolana(
+            this.rpcProvider,
+            async (transaction) => {
+                transaction.partialSign(this.signer);
+                return transaction;
+            },
+            CONTRACTS[this.network].solana.core,
+            payerAddr,
+            Buffer.from(vaaBytes),
+        );
+
         const transaction = await redeemOnSolana(
             this.rpcProvider,
             CONTRACTS[this.network].solana.core,
             CONTRACTS[this.network].solana.token_bridge,
-            this.signer.publicKey.toBase58(),
+            payerAddr,
             vaaBytes,
         );
         const hash = await this.signAndSend(transaction);
@@ -453,7 +467,8 @@ class SolanaTransactor extends BaseTransactor {
     async createWrapped({ vaaBytes }: GetSignedVAAResponse): Promise<DestChainTxResult> {
         const payerAddr = this.signer.publicKey.toBase58();
 
-        await postVaaSolana(this.rpcProvider,
+        await postVaaSolana(
+            this.rpcProvider,
             async (transaction) => {
                 transaction.partialSign(this.signer);
                 return transaction;
@@ -496,7 +511,7 @@ export class BridgeTransactor {
     solTransactor: SolanaTransactor;
     network: NetworkType;
 
-    constructor(ethConf: EthereumConfig, solConf: SolanaConfig, network: NetworkType = 'TESTNET', wormholeRpcUri?: string) {
+    constructor(ethConf: EthereumConfig, solConf: SolanaConfig, wormholeRpcUri?: string, network: NetworkType = 'TESTNET') {
         this.network = network;
         this.wormholeRpcUri = wormholeRpcUri || wormholeRpcUrl;
         try {
@@ -521,25 +536,19 @@ export class BridgeTransactor {
     async listTokens(origin: GlobalAddr): Promise<Partial<Record<SupportedChain, string>>> {
         let result: Partial<Record<SupportedChain, string>> = {};
         await Promise.all(SUPPORTED_CHAINS.map(async (chain) => {
-            result[chain] = (await this.getTokenAddr(chain, origin)).addr || undefined;
+            const { addr } = await this.getTokenAddr(chain, origin);
+            result[chain] = addr || undefined;
         }));
         return result;
     }
 
     /** not atomic */
-    async teleportToken(origin: GlobalAddr, src: SupportedChain, dst: SupportedChain, amount: ethers.BigNumber): Promise<TeleportResult> {
+    async teleportToken(origin: GlobalAddr, src: SupportedChain, dst: SupportedChain, amount: bigint): Promise<TeleportResult> {
         if (src === dst) {
             throw new Error("no need to bridge");
         }
 
-        const srcAddr = await this.getTokenAddr(src, origin);
-        const dstAddr = await this.getTokenAddr(dst, origin);
-
-        if (!srcAddr.addr || !dstAddr.addr) {
-            throw new Error("given address may not deployed on the source or destination chain");
-        }
-
-        const srcRes = await this.lockToken(srcAddr.chain, dstAddr.chain, srcAddr.addr, amount);
+        const srcRes = await this.lockToken(src, dst, origin, amount);
         if (srcRes.vaas.length !== 1) console.log('expected vaa is one, but getting more or less');
 
         const vaa = srcRes.vaas.pop();
@@ -548,7 +557,7 @@ export class BridgeTransactor {
             throw new Error("vaa is stil not signed by guardians. try again later.");
         };
 
-        const destRes = await this.redeemToken(dstAddr.chain, vaa)
+        const destRes = await this.redeemToken(dst, vaa)
             .catch((e) => {
                 console.log(srcRes);
                 return Promise.reject(e);
@@ -561,23 +570,25 @@ export class BridgeTransactor {
         return (chain === 'solana') ? this.solTransactor.signer.publicKey.toBase58() : this.ethTransactors[chain].signer.address;
     }
 
-    async lockToken(src: SupportedChain, dst: SupportedChain, tokenAddr: string, amount: ethers.BigNumber): Promise<SrcChainTxResult> {
-        if (src === dst) {
-            throw new Error("no need to lock");
+    async lockToken(src: SupportedChain, dst: SupportedChain, origin: GlobalAddr, amount: bigint): Promise<SrcChainTxResult> {
+        if (src === dst) throw new Error("no need to lock");
+
+        const { addr: srcAddr } = await this.getTokenAddr(src, origin);
+        const { addr: dstAddr } = await this.getTokenAddr(dst, origin);
+
+        if (!srcAddr || !dstAddr) throw new Error("given address may not deployed on the source or destination chain");
+
+        let to: Uint8Array;
+        if (dst === 'solana') {
+            const { addr: receipient } = await this.solTransactor.getAssociatedAccountInfo(dstAddr);
+            to = tryNativeToUint8Array(receipient.toBase58(), dst);
+        } else {
+            to = tryNativeToUint8Array(this.signerAddress(dst), dst);
         }
 
         const { hash, sequence } =
-            (src === 'solana') ? await this.solTransactor.lockToken(
-                    dst,
-                    tryNativeToUint8Array(this.signerAddress(dst), dst),
-                    tokenAddr,
-                    amount.toBigInt(),
-                ) : await this.ethTransactors[src].lockToken(
-                    dst,
-                    tryNativeToUint8Array(this.signerAddress(dst), dst),
-                    tokenAddr,
-                    amount,
-                );
+            (src === 'solana') ? await this.solTransactor.lockToken(dst, to, srcAddr, amount)
+                : await this.ethTransactors[src].lockToken(dst, to, srcAddr, amount);
 
         const vaas = await this.getVAAWithSeq(sequence, src, CONTRACTS[this.network][src].token_bridge)
             .catch((e) => {
@@ -585,7 +596,7 @@ export class BridgeTransactor {
                 return Promise.resolve([]);
             });
 
-        return { hash, vaas }
+        return { hash, vaas };
     }
 
     redeemToken(dst: SupportedChain, vaa: GetSignedVAAResponse): Promise<DestChainTxResult>;
@@ -597,15 +608,8 @@ export class BridgeTransactor {
             return (dst === 'solana') ? this.solTransactor.redeemToken(vaa) : this.ethTransactors[dst].redeemToken(vaa);
         } else if (typeof info === 'string') {
             const txHash = info;
-            let seq: string[];
-            switch (src) {
-                case undefined: throw new Error("source chain not provided");
-                case 'solana': {
-                    seq = await this.solTransactor.getSeqFromTxHash(txHash);
-                    break;
-                }
-                default: seq = await this.ethTransactors[src].getSeqFromTxHash(txHash);
-            }
+            if (!src) throw new Error("source chain not provided");
+            const seq = (src === 'solana') ? await this.solTransactor.getSeqFromTxHash(txHash) : await this.ethTransactors[src].getSeqFromTxHash(txHash);
             if (!seq || seq.length === 0) throw new Error("unknow error occurred");
 
             const vaas = await this.getVAAWithSeq(seq, src, CONTRACTS[this.network][src].token_bridge);
@@ -638,8 +642,8 @@ export class BridgeTransactor {
 
         return {
             chain,
-            addr: ((chain === 'solana')
-                ? await this.solTransactor.getTokenAddr(origin.chain, originTokenAddr)
+            addr: (
+                (chain === 'solana') ? await this.solTransactor.getTokenAddr(origin.chain, originTokenAddr)
                 : await this.ethTransactors[chain].getTokenAddr(origin.chain, originTokenAddr)
             ) || "",
         };
@@ -654,15 +658,8 @@ export class BridgeTransactor {
             return (dst === 'solana') ? this.solTransactor.createWrapped(vaa) : this.ethTransactors[dst].createWrapped(vaa);
         } else if (typeof info === 'string') {
             const txHash = info;
-            let seq: string[];
-            switch (src) {
-                case undefined: throw new Error("source chain not provided");
-                case 'solana': {
-                    seq = await this.solTransactor.getSeqFromTxHash(txHash);
-                    break;
-                }
-                default: seq = await this.ethTransactors[src].getSeqFromTxHash(txHash);
-            }
+            if (!src) throw new Error("source chain not provided");
+            const seq = (src === 'solana') ? await this.solTransactor.getSeqFromTxHash(txHash) : await this.ethTransactors[src].getSeqFromTxHash(txHash);
             if (!seq || seq.length === 0) throw new Error("unknow error occurred");
 
             const vaas = await this.getVAAWithSeq(seq, src, CONTRACTS[this.network][src].token_bridge);
@@ -684,16 +681,14 @@ export class BridgeTransactor {
             getEmitterAddressEth(CONTRACTS[this.network][from].token_bridge),
         );
         
-        return { hash, vaas }
+        return { hash, vaas };
     }
 
     /** not atomic */
     async attestAndWrap(token: string, src: Ethereumish, dsts: SupportedChain[]): Promise<BridgeInitResult> {
         /** attesting token and get Vaa */
         const target = [...new Set(dsts)].filter((dst) => dst !== src);
-        if (target.length === 0) {
-            throw new Error("no valid destination");
-        }
+        if (target.length === 0) throw new Error("no valid destination");
 
         const { hash: srcHash, vaas } = await this.attestToken(token, src);
 
@@ -708,7 +703,7 @@ export class BridgeTransactor {
         /** create wrapped token on each chain */
         const deployResult = await Promise.all(target.map(
             (dst) => this.createWrapped(vaa, dst)
-                .catch((e: Error) => Promise.resolve({ error: `failed to wrap on ${dst} for ${e.name}: ${e.message}\n${e.stack || ""}` }))
+                .catch((e: Error) => Promise.resolve({ error: `failed to wrap on ${dst} for\n${e.name}: ${e.message}\n${e.stack || ""}` }))
                 .then((res) => ({ ...res, chain: dst }))
         ));
 

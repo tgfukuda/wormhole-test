@@ -1,6 +1,7 @@
 import { BridgeTransactor, Asset, printSolkeyFromBase58, GlobalAddr } from './bridge';
 import ASSETS from '../assets.testnet.json';
 import { ethers } from 'ethers';
+import { tryHexToNativeString, tryNativeToUint8Array } from '@certusone/wormhole-sdk';
 
 const attestHash = '0x7fdcdd34ab07560a6b8d7423b598bc47a5ee80d78c270eaae957aa49f379d7d2';
 const teleportHashSolana = '0xb612a6d7b654c45f0e9b9e77732de6641d594ec9e8d53e3e6a8c64262a2383eb';
@@ -17,12 +18,10 @@ const solDefaultConf = {
 
 const transactor = new BridgeTransactor(ethDefaultConf, solDefaultConf);
 
-const amount = ethers.BigNumber.from(ethers.utils.parseEther('1'));
 const origin: GlobalAddr = {
     chain: 'ethereum',
     addr: ASSETS.ExampleToken.ethereum,
 };
 
-transactor.lockToken('ethereum', 'avalanche', ASSETS.ExampleToken.ethereum, amount)
+transactor.lockToken('solana', 'ethereum', origin, ethers.utils.parseUnits("1", 9).toBigInt())
     .then(console.log)
-    
