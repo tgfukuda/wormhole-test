@@ -139,7 +139,7 @@ abstract class BaseTransactor {
 class EthereumishTransactor extends BaseTransactor {
     /**
      * base signer, keep in mind that it has no connection to rpc provider
-     * use `connectedEthSigner`
+     * use `connectedEthSigner` instead
      */
      signer: ethers.Wallet;
      rpcProvider: ethers.providers.JsonRpcProvider;
@@ -249,9 +249,7 @@ class EthereumishTransactor extends BaseTransactor {
         );
         const hash = receipt.transactionHash;
 
-        return {
-            hash,
-        };
+        return { hash };
     }
 
     async attestToken(tokenAddress: string): Promise<Attestation> {
@@ -450,9 +448,7 @@ class SolanaTransactor extends BaseTransactor {
         );
         const hash = await this.signAndSend(transaction);
 
-        return {
-            hash,
-        };
+        return { hash };
     }
 
     async attestToken(tokenAddress: string): Promise<Attestation> {
@@ -467,10 +463,7 @@ class SolanaTransactor extends BaseTransactor {
 
         const sequence = await this.getSeqFromTxHash(hash);
 
-        return {
-            hash,
-            sequence,
-        };
+        return { hash, sequence };
     }
 
     async createWrapped({ vaaBytes }: GetSignedVAAResponse): Promise<DestChainTxResult> {
@@ -496,9 +489,7 @@ class SolanaTransactor extends BaseTransactor {
         );
         
         const hash = await this.signAndSend(transaction);
-        return {
-            hash,
-        };
+        return { hash };
     }
 
     async getTokenAddr(originChain: SupportedChain, originTokenAddr: Uint8Array) {
