@@ -107,8 +107,6 @@ export type GlobalAddr = EthAddr | SolAddr;
 
 export type NetworkType = 'MAINNET' | 'TESTNET';
 
-export type Asset = Record<string, Partial<Record<SupportedChain, string>>>;
-
 const retryInfinity: <T>(f: () => Promise<T>, pred?: (res: T) => boolean) => ReturnType<typeof f> =
     async <T>(f: () => Promise<T>, pred?: (res: T) => boolean) => {
         while (true) {
@@ -664,7 +662,7 @@ export class BridgeTransactor {
         const vaas = await this.getVAAWithSeq(
             sequence,
             from,
-            getEmitterAddressEth(CONTRACTS[this.network][from].token_bridge),
+            CONTRACTS[this.network][from].token_bridge,
         );
         
         return { hash, vaas };

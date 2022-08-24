@@ -1,7 +1,6 @@
 {
     "ExampleToken": {
         "ethereum": "0x4319D92C172acaE5D37724C139f86179F37C29CC",
-        "solana": "2QyfbmsUNXkYeT6udGkf6Qp6T457wimH9C8WGEUdX5cd",
-        "avalanche": "0xfDdD74982f17E24875E9Ae0C81f6329Eb0611Dd9"
+        "attestHash": "0x7fdcdd34ab07560a6b8d7423b598bc47a5ee80d78c270eaae957aa49f379d7d2"
     }
 }
