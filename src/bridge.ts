@@ -42,7 +42,7 @@ const defaultRpcs: Partial<Record<SupportedChain, string>> = {
     'solana': clusterApiUrl('devnet'),
     'avalanche': 'https://api.avax-test.network/ext/bc/C/rpc',
     'polygon': 'https://rpc-mumbai.matic.today',
-    'bsc': 'https://data-seed-prebsc-1-s1.binance.org:8545/',
+    'bsc': 'https://data-seed-prebsc-1-s1.binance.org:8545',
 };
 
 /**
@@ -134,7 +134,7 @@ abstract class BaseTransactor {
     abstract getTokenAddr(originChain: SupportedChain, originTokenAddr: Uint8Array): Promise<string | null>;
     abstract attestToken(tokenAddress: string): Promise<Attestation>;
     abstract createWrapped({ vaaBytes }: GetSignedVAAResponse): Promise<DestChainTxResult>;
-    abstract lockToken(dst: SupportedChain, to: Uint8Array, tokenAddr: string, amount: bigint): Promise<Attestation>;
+    abstract lockToken(dst: SupportedChain, to: Uint8Array, tokenAddr: string, amount: bigint, origin?: GlobalAddr): Promise<Attestation>;
     abstract redeemToken({ vaaBytes }: GetSignedVAAResponse): Promise<DestChainTxResult>;
 }
 
@@ -294,16 +294,16 @@ class SolanaTransactor extends BaseTransactor {
     signer: Keypair;
     rpcProvider: Connection;
 
-    constructor(solConf: SolanaConfig, network: NetworkType) {
+    constructor(rpcProvider: Connection, signer: Keypair, network: NetworkType) {
         super(network)
-        this.rpcProvider = new Connection(solConf.rpcUri || defaultRpcs.solana || "", 'confirmed');
-        this.signer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(solConf.privKeyPath).toString())));
+        this.rpcProvider = rpcProvider;
+        this.signer = signer;
     }
 
     async getTxEvents(hash: string) {
-        const tx = await this.rpcProvider.getTransaction(hash)
+        const tx = await this.rpcProvider.getTransaction(hash);
 
-        console.log(tx?.transaction.message.accountKeys.map(p => p.toBase58()))
+        console.log(tx?.transaction.message.accountKeys.map(p => p.toBase58()));
 
         if (tx?.transaction.message.accountKeys && tx.meta?.innerInstructions) {
             for (const instruction of tx.meta.innerInstructions) {
@@ -312,8 +312,6 @@ class SolanaTransactor extends BaseTransactor {
                 })
             }
         }
-
-        console.log(TOKEN_PROGRAM_ID.toBase58())
     }
 
     async getSeqFromTxHash(hash: string): Promise<string[]> {
@@ -330,13 +328,13 @@ class SolanaTransactor extends BaseTransactor {
     async signAndSend(transaction: Transaction): Promise<string> {
         transaction.partialSign(this.signer);
         const hash = await this.rpcProvider.sendRawTransaction(transaction.serialize());
-        
+
         const { blockhash, lastValidBlockHeight } = await this.rpcProvider.getLatestBlockhash();
 
         const confirmation = await this.rpcProvider.confirmTransaction({
             blockhash,
             lastValidBlockHeight,
-            signature: hash
+            signature: hash,
         });
 
         if (confirmation.value.err) {
@@ -353,7 +351,7 @@ class SolanaTransactor extends BaseTransactor {
             ASSOCIATED_TOKEN_PROGRAM_ID,
             TOKEN_PROGRAM_ID,
             mintKey,
-            this.signer.publicKey
+            this.signer.publicKey,
         );
         const associatedInfo = await this.rpcProvider.getAccountInfo(addr);
         if (!associatedInfo) {
@@ -364,7 +362,7 @@ class SolanaTransactor extends BaseTransactor {
                     mintKey,
                     addr,
                     this.signer.publicKey,
-                    this.signer.publicKey
+                    this.signer.publicKey,
                 )
             );
 
@@ -380,10 +378,7 @@ class SolanaTransactor extends BaseTransactor {
             });
         }
 
-        return {
-            addr,
-            associatedInfo,
-        };
+        return { addr, associatedInfo };
     }
 
     async getTokenBalance(tokenAddr: string) {
@@ -407,9 +402,9 @@ class SolanaTransactor extends BaseTransactor {
         return 0n;
     }
 
-    async lockToken(dst: SupportedChain, to: Uint8Array, tokenAddr: string, amount: BigInt): Promise<Attestation> {
+    async lockToken(dst: SupportedChain, to: Uint8Array, tokenAddr: string, amount: BigInt, origin: GlobalAddr): Promise<Attestation> {
         const { addr: fromAddr } = await this.getAssociatedAccountInfo(tokenAddr);
-        
+
         const transaction = await transferFromSolana(
             this.rpcProvider,
             CONTRACTS[this.network].solana.core,
@@ -419,7 +414,9 @@ class SolanaTransactor extends BaseTransactor {
             tokenAddr,
             amount,
             to,
-            dst
+            dst,
+            (origin.chain !== 'solana') ? tryNativeToUint8Array(origin.addr || "", origin.chain) : undefined,
+            (origin.chain !== 'solana') ? origin.chain : undefined,
         );
         const hash = await this.signAndSend(transaction);
         
@@ -537,14 +534,15 @@ export class BridgeTransactor {
                 fs.readFileSync(path.join(ethConf.keystorePath, keystoreJsonFile)).toString(),
                 fs.readFileSync(ethConf.passwordPath),
             );
+            const keypair = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(solConf.privKeyPath).toString())))
             this.ethTransactors = ETHEREUMISH.reduce((transactors, chain) => ({
                 ...transactors, 
                 [chain]: new EthereumishTransactor(new ethers.providers.JsonRpcProvider(ethConf[chain] || defaultRpcs[chain]), signer, chain, network),
             }), {} as Record<Ethereumish, EthereumishTransactor>);
+            this.solTransactor = new SolanaTransactor(new Connection(solConf.rpcUri || defaultRpcs.solana || "", 'confirmed'), keypair, network);
         } catch (e) {
             throw e;
         }
-        this.solTransactor = new SolanaTransactor(solConf, network);
     }
 
     signerAddress(chain: SupportedChain) {
@@ -559,7 +557,7 @@ export class BridgeTransactor {
             log,
             nodeTransport,
             DEFAULT_RETRY_TIMEOUT,
-            DEFAULT_RETRY_LIMIT
+            DEFAULT_RETRY_LIMIT,
         )));
     }
 
@@ -612,7 +610,7 @@ export class BridgeTransactor {
         }
 
         const { hash, sequence } =
-            (src === 'solana') ? await this.solTransactor.lockToken(dst, to, srcAddr, amount)
+            (src === 'solana') ? await this.solTransactor.lockToken(dst, to, srcAddr, amount, origin)
                 : await this.ethTransactors[src].lockToken(dst, to, srcAddr, amount);
 
         const vaas = await this.getVAAWithSeq(sequence, src, CONTRACTS[this.network][src].token_bridge)
@@ -709,7 +707,7 @@ export class BridgeTransactor {
             if (vaa) {
                 return vaa;
             } else {
-                throw "waiting for signed...";
+                throw "waiting for sign...";
             }
         });
 
