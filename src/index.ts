@@ -21,5 +21,9 @@ const origin: GlobalAddr = {
 };
 
 // EX.
-// transactor.teleportToken(origin, 'solana', 'ethereum', ethers.utils.parseUnits("1", 7).toBigInt())
+// send 1 token from solana to ethereum
+// transactor.teleportToken(origin, 'solana', 'ethereum', ethers.utils.parseUnits("1", 8).toBigInt())
 //     .then(console.log);
+//send 1 token from ethereum to solana
+// transactor.teleportToken(origin, 'ethereum', 'solana', ethers.utils.parseEther("1").toBigInt())
+//     .then(console.log)

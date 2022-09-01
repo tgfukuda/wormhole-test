@@ -107,8 +107,8 @@ export type GlobalAddr = EthAddr | SolAddr;
 
 export type NetworkType = 'MAINNET' | 'TESTNET';
 
-const retryInfinity: <T>(f: () => Promise<T>, pred?: (res: T) => boolean) => ReturnType<typeof f> =
-    async <T>(f: () => Promise<T>, pred?: (res: T) => boolean) => {
+export const retryInfinity =
+    async <T>(f: () => Promise<T>, pred?: (res: T) => boolean, interval?: number) => {
         while (true) {
             try {
                 const res = await f();
@@ -515,18 +515,22 @@ export class BridgeTransactor {
         this.network = network;
         this.wormholeRpcUri = wormholeRpcUri || wormholeRpcUrl;
         try {
-            const keystoreJsonFile = fs.readdirSync(ethConf.keystorePath).pop();
-            if (!keystoreJsonFile) {
+            let signer: ethers.Wallet | null = null;
+            for (const keystoreJsonFile of fs.readdirSync(ethConf.keystorePath)) {
+                try {
+                    signer = ethers.Wallet.fromEncryptedJsonSync(
+                        fs.readFileSync(path.join(ethConf.keystorePath, keystoreJsonFile)).toString(),
+                        fs.readFileSync(ethConf.passwordPath),
+                    );
+                } catch (e) {}
+            }
+            if (signer === null) {
                 throw new Error("keystore may have no account.");
             }
-            const signer = ethers.Wallet.fromEncryptedJsonSync(
-                fs.readFileSync(path.join(ethConf.keystorePath, keystoreJsonFile)).toString(),
-                fs.readFileSync(ethConf.passwordPath),
-            );
             const keypair = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(solConf.privKeyPath).toString())))
             this.ethTransactors = ETHEREUMISH.reduce((transactors, chain) => ({
                 ...transactors, 
-                [chain]: new EthereumishTransactor(new ethers.providers.JsonRpcProvider(ethConf[chain] || defaultRpcs[chain]), signer, chain, network),
+                [chain]: new EthereumishTransactor(new ethers.providers.JsonRpcProvider(ethConf[chain] || defaultRpcs[chain]), signer as ethers.Wallet, chain, network),
             }), {} as Record<Ethereumish, EthereumishTransactor>);
             this.solTransactor = new SolanaTransactor(new Connection(solConf.rpcUri || defaultRpcs.solana || "", 'confirmed'), keypair, network);
         } catch (e) {
