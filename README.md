@@ -1,5 +1,14 @@
 # wormhole bridge client
 
+## requirements
+
+1. basic knowledge of ERC20, blockchain
+2. nodejs runtime
+3. valid ethereum wallet as a keystore and its password
+4. valid solana wallet as a byte array. printSolkeyFromBase58 is exported from bridge.ts. if you have a base58 privatekey, convert it. 
+
+## contents
+
 `src/bridge.ts`:
 
 wormhole bridge wrapper. basic methods for ERC20 included.
