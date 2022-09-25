@@ -23,5 +23,5 @@ npm i
 npx ts-node index.ts
 ```
 
-to get any constant, refer to https://github.com/certusone/wormhole/blob/dev.v2/bridge_ui/src/utils/consts.ts
+to get any constant, refer to https://github.com/wormhole-foundation/example-token-bridge-ui/blob/main/src/utils/consts.ts
 or ask on an official discord
